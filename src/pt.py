@@ -43,9 +43,9 @@ def step_gauss_pt(A_t, a_t, B, M_t, sigma_0, stepsize):
     a_t_new = a_t # a_t remains constant in this case
     return A_t_new, a_t_new
 
-class BrenierMap:
-    def __init__(self, A, a):
-        """Base Brenier map (placeholder for non-Gaussian cases).
+class Tangent:
+    def __init__(self ):
+        """Base Tangent class.
 
         Parameters
         ----------
@@ -55,9 +55,19 @@ class BrenierMap:
             Vector component of the tangent vector.
         """
         pass
-        # to be implemented for non-Gaussian case
 
-class BrenierGaussian(BrenierMap):
+    def pushforward_measure(self, t):
+        """Compute the pushforward mean and covariance at time t."""
+        pass
+
+    def interpolate(self):
+        pass
+
+    def parallel_transport(self):
+        pass
+
+
+class BrenierGaussian(Tangent):
     def __init__(self, mean0, sigma0, A, a):
         """Brenier map for Gaussian measures along a geodesic.
 
