@@ -5,7 +5,11 @@ import scipy.linalg as linalg
 from scipy.spatial import cKDTree
 import ot
 import numpy as np
-
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
+# import warnings
+import warnings
 # change to latex font
 
 
@@ -220,7 +224,6 @@ def wasserstein_logmap(src: EmpiricalMeasure, dst: EmpiricalMeasure):
     tangent = coupling_to_tan(coupling, src, locs_dst)
     return tangent
 
-
 # tangents will be vector fields supported on the source
 def expmap_euclidean(src, tangent):
     # compute the exponential map of tangent at src
@@ -229,7 +232,6 @@ def expmap_euclidean(src, tangent):
 def logmap_euclidean(src, dst):
     # compute the logarithmic map of dst at src
     return dst - src
-
 
 def wasserstein_expmap_coupling(base: EmpiricalMeasure, tangent: Tangent = None):
     # compute the exponential map of tangent at src in the Wasserstein space (for empirical measures)
@@ -255,9 +257,6 @@ def align_by_nearest(X_from, X_to, tol=1e-8):
             f"Bad index={bad}."
         )
     return idx
-
-
-
 
 def transport_field_under_coupling(vels_src, coupling):
     """
@@ -287,8 +286,6 @@ def transport_field_under_coupling(vels_src, coupling):
     mask = dst_weights > 0
     vels_dst[mask] = num[mask] / dst_weights[mask, None]
     return vels_dst, dst_weights
-
-
 
 class W2EuclideanTangent(Tangent):
     def __init__(self, src_measure: EmpiricalMeasure, vels = None, coupling = None, locs_dst = None):
@@ -334,7 +331,7 @@ class W2EuclideanTangent(Tangent):
             raise ValueError("Tangent must be given by either (vels, locs_src) or (coupling, locs_src, locs_dst).")
 
 
-    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1):
+    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1, project=False):
         if self.coupling is not None:
             print("Warning: coupling is being converted to velocity mode via barycentric projection for parallel transport.")
             tangent = barycentric_projection_tangent(self)
@@ -353,16 +350,250 @@ class W2EuclideanTangent(Tangent):
                 tangent=tangent,
                 incremental_tangent=incremental_tangent,
             )
+            if project:
+                tangent = project_tan(tangent) # project back onto gradient fields
 
         return tangent
 
 
+def _default_compact_kernel(t):
+    """
+    Compactly supported kernel on R_+ with support [0,1].
+    Input: t = ||x_i-x_j||^2 / h^2.
+    """
+    t = np.asarray(t, dtype=float)
+    out = 1.0 - t
+    out[out < 0.0] = 0.0
+    return out
 
-def project_tan(tangent: W2EuclideanTangent):
-    # project tangent vector onto tangent space (L_2(mu) gradient fields)
-    ## TO BE IMPLEMENTED ##
-    return tangent
+def _solve_potential_with_gauge(L, g, ridge=0.0):
+    """
+    Solve L U = g with global mean-zero gauge 1^T U = 0.
 
+    If the graph is disconnected, raise a warning and stop.
+    """
+
+    N = L.shape[0]
+    g = np.asarray(g, dtype=float).reshape(-1)
+
+    if g.shape[0] != N:
+        raise ValueError("g must have shape (N,)")
+
+    # Check connectivity
+    n_comp, labels = connected_components(L, directed=False, connection="weak")
+
+    if n_comp > 1:
+        warnings.warn(
+            f"Graph has {n_comp} connected components. "
+            "Projection requires connected graph. Aborting.",
+            RuntimeWarning,
+        )
+        raise RuntimeError("Graph is disconnected.")
+
+    # Optional ridge (numerical stability only)
+    if ridge > 0:
+        L = (L + ridge * sp.eye(N, format="csr")).tocsr()
+
+    # KKT system:
+    # [L  1][U] = [g]
+    # [1^T 0][λ]   [0]
+
+    one = np.ones(N, dtype=float)
+    one_col = sp.csr_matrix(one.reshape(-1, 1))
+
+    top = sp.hstack([L, one_col], format="csr")
+    bottom = sp.hstack([one_col.T, sp.csr_matrix((1, 1))], format="csr")
+    KKT = sp.vstack([top, bottom], format="csr")
+
+    rhs = np.zeros(N + 1, dtype=float)
+    rhs[:N] = g
+    rhs[N] = 0.0
+
+    sol = spla.spsolve(KKT, rhs)
+    U = np.asarray(sol[:N], dtype=float)
+
+    # numerical cleanup
+    U -= U.mean()
+
+    return U
+
+
+def project_tan(
+    tangent: "W2EuclideanTangent",
+    h: float = None,
+    h_r: float = None,
+    kernel=_default_compact_kernel,
+    alpha_reg: float = 0.0,
+    min_neighbors: int = 15,     # <---- new
+    k_bandwidth: int = 30,      # <---- used when h/h_r are None
+):
+    """
+    Weighted Helmholtz-Hodge projection aligned with the manuscript, with the
+    extra guarantee that each node has at least `min_neighbors` neighbors.
+
+    Graph weights: w_ij = (1/h^d) K(||xi-xj||^2 / h^2)
+    Regression weights: K(||xi-x||^2 / h_r^2) (no 1/h_r^d needed; cancels)
+    """
+
+    # coupling -> velocity if needed
+    if getattr(tangent, "coupling", None) is not None:
+        tangent = barycentric_projection_tangent(tangent)
+
+    X = np.asarray(tangent.src_measure.locs, float)
+    V = np.asarray(tangent.vels, float)
+    N, d = X.shape
+
+    if N <= min_neighbors:
+        # not enough points to guarantee min_neighbors; return as-is
+        return tangent
+
+    tree = cKDTree(X)
+
+    # ---------------------------------------------------------
+    # Choose bandwidths via kNN if not provided
+    # ---------------------------------------------------------
+    if h is None or h_r is None:
+        k0 = min(k_bandwidth, N - 1)
+        dists, _ = tree.query(X, k=k0 + 1)  # includes self at column 0
+        h_knn = float(np.mean(dists[:, k0]))
+        if h is None:
+            h = h_knn
+        if h_r is None:
+            h_r = h_knn
+
+    if h <= 0 or h_r <= 0:
+        raise ValueError("h and h_r must be positive.")
+
+    # ---------------------------------------------------------
+    # Step 1: Build graph edges, ensuring >= min_neighbors per node
+    # ---------------------------------------------------------
+    # Start with radius neighbors (manuscript-style)
+    neigh = tree.query_ball_point(X, r=h)
+
+    # Track neighbor sets (undirected)
+    nbrs = [set(int(j) for j in neigh[i] if j != i) for i in range(N)]
+
+    # Augment with kNN edges where needed
+    k_need = min_neighbors
+    for i in range(N):
+        if len(nbrs[i]) >= k_need:
+            continue
+        # query k_need nearest (plus self) and add them
+        dists_i, idx_i = tree.query(X[i], k=min(k_need + 1, N))
+        idx_i = [int(j) for j in np.atleast_1d(idx_i) if int(j) != i]
+        for j in idx_i:
+            nbrs[i].add(j)
+            nbrs[j].add(i)
+
+    # Build unique undirected edges i<j from nbrs
+    src, dst, weights = [], [], []
+    for i in range(N):
+        for j in nbrs[i]:
+            if j <= i:
+                continue
+            dx = X[j] - X[i]
+            t = float(np.dot(dx, dx)) / (h * h)
+            kij = float(kernel(np.array([t]))[0])
+            if kij > 0.0:
+                src.append(i)
+                dst.append(j)
+                weights.append(kij / (h ** d))
+            else:
+                # If the kernel is compact and t>1, weight is 0.
+                # But we *still* want the connectivity guarantee; in that case,
+                # add a tiny weight so the edge exists numerically.
+                # This preserves the "at least 5 neighbors" requirement.
+                # (If you prefer: increase h instead of adding tiny weight.)
+                src.append(i)
+                dst.append(j)
+                weights.append(1e-12 / (h ** d))
+
+    src = np.asarray(src, dtype=int)
+    dst = np.asarray(dst, dtype=int)
+    weights = np.asarray(weights, dtype=float)
+    M = len(src)
+
+    if M == 0:
+        return tangent
+
+    # ---------------------------------------------------------
+    # Step 2: Edge actions
+    # ---------------------------------------------------------
+    DX = X[dst] - X[src]
+    a_edge = 0.5 * np.einsum("ij,ij->i", V[src] + V[dst], DX)
+
+    # ---------------------------------------------------------
+    # Step 3: Potential fit via weighted Laplacian
+    # ---------------------------------------------------------
+    rows = np.arange(M)
+    data = np.concatenate([-np.ones(M), np.ones(M)])
+    cols = np.concatenate([src, dst])
+    rows2 = np.concatenate([rows, rows])
+
+    delta = sp.coo_matrix((data, (rows2, cols)), shape=(M, N)).tocsr()
+    Wedge = sp.diags(weights, format="csr")
+
+    L = (delta.T @ Wedge @ delta).tocsr()
+    g = (delta.T @ (weights * a_edge))
+    g = np.asarray(g, dtype=float).reshape(-1)
+
+    try:
+        U = _solve_potential_with_gauge(L, g, ridge=0.0)
+    except Exception:
+        U = _solve_potential_with_gauge(L, g, ridge=1e-10)
+
+    # ---------------------------------------------------------
+    # Step 4: Local linear gradient extraction with >= min_neighbors
+    # ---------------------------------------------------------
+    G = np.zeros((N, d), dtype=float)
+
+    # Start with radius regression neighbors
+    neigh_r = tree.query_ball_point(X, r=h_r)
+
+    for i in range(N):
+        js = [int(j) for j in neigh_r[i] if int(j) != i]
+
+        # Ensure at least min_neighbors by kNN fallback
+        if len(js) < min_neighbors:
+            d_i, idx_i = tree.query(X[i], k=min(min_neighbors + 1, N))
+            idx_i = [int(j) for j in np.atleast_1d(idx_i) if int(j) != i]
+            js = list(set(js).union(idx_i))
+
+        js = np.asarray(js, dtype=int)
+        if js.size == 0:
+            continue
+
+        DX_loc = X[js] - X[i]
+        t = np.sum(DX_loc * DX_loc, axis=1) / (h_r * h_r)
+        K_loc = kernel(t)
+
+        # Keep positives; if too few survive, fall back to kNN weights without truncation
+        mask = K_loc > 0
+        if np.sum(mask) < min_neighbors:
+            # Use all js but with a soft weight floor for numerical stability
+            K_loc = np.maximum(K_loc, 1e-12)
+        else:
+            js = js[mask]
+            DX_loc = DX_loc[mask]
+            K_loc = K_loc[mask]
+
+        y = U[js]
+
+        B = np.column_stack([np.ones(len(js)), DX_loc])  # (m, 1+d)
+        w = K_loc.astype(float)
+        # Build BtWB without forming dense diag:
+        BtWB = B.T @ (B * w[:, None])
+        BtWy = B.T @ (w * y)
+
+        A = BtWB + alpha_reg * np.eye(d + 1)
+        try:
+            beta = np.linalg.solve(A, BtWy)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.lstsq(A, BtWy, rcond=None)[0]
+
+        G[i] = beta[1:]
+
+    return W2EuclideanTangent(src_measure=tangent.src_measure, vels=G)
 
 def deterministic_step_to_coupling(current: EmpiricalMeasure, incremental_tangent: W2EuclideanTangent):
     """
