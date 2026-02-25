@@ -424,9 +424,10 @@ def project_tan(
     h: float = None,
     h_r: float = None,
     kernel=_default_compact_kernel,
-    alpha_reg: float = 0.0,
+    alpha_reg: float = 0.1,
     min_neighbors: int = 15,     # <---- new
-    k_bandwidth: int = 30,      # <---- used when h/h_r are None
+    k_bandwidth: int = 25,      # <---- used when h/h_r are None
+    mixing_param: float = 1.0, # how much to mix the original tangent vs the projected tangent (dim * 0.5 means average, dim * 1.0 means full projection
 ):
     """
     Weighted Helmholtz-Hodge projection aligned with the manuscript, with the
@@ -538,10 +539,11 @@ def project_tan(
     g = (delta.T @ (weights * a_edge))
     g = np.asarray(g, dtype=float).reshape(-1)
 
-    try:
-        U = _solve_potential_with_gauge(L, g, ridge=0.0)
-    except Exception:
-        U = _solve_potential_with_gauge(L, g, ridge=1e-10)
+    # try:
+    #     U = _solve_potential_with_gauge(L, g, ridge=0.0)
+    # except Exception:
+    #     U = _solve_potential_with_gauge(L, g, ridge=1e-10)
+    U = _solve_potential_with_gauge(L, g, ridge=alpha_reg)
 
     # ---------------------------------------------------------
     # Step 4: Local linear gradient extraction with >= min_neighbors
@@ -593,6 +595,8 @@ def project_tan(
             beta = np.linalg.lstsq(A, BtWy, rcond=None)[0]
 
         G[i] = beta[1:]
+    dim = G.shape[1]
+    G = mixing_param/dim * G + (1 - mixing_param/dim) * V # scale mixing by 1/d due to curse of dimensionality (empirically seems to help in high d, but you can set mixing_param=d for no scaling)
 
     return W2EuclideanTangent(src_measure=tangent.src_measure, vels=G)
 
