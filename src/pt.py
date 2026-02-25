@@ -421,6 +421,7 @@ def _solve_potential_with_gauge(L, g, ridge=0.0):
 
 def project_tan(
     tangent: "W2EuclideanTangent",
+    
     h: float = None,
     h_r: float = None,
     kernel=_default_compact_kernel,
