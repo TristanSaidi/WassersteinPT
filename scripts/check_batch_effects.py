@@ -9,6 +9,9 @@ import seaborn as sns
 from pathlib import Path
 from scipy import stats
 
+out_dir = Path('../outputs/GSE103334')
+out_dir.mkdir(parents=True, exist_ok=True)
+
 # Load data
 print("Loading data...")
 data_file = Path("../data/GSE103334/GSE103334_FPKM_CKP25_TOPHAT.txt.gz")
@@ -167,8 +170,8 @@ for idx, gene in enumerate(key_genes):
 plt.suptitle('Per-Mouse Variability: Thin lines = individual mice, Thick lines = condition mean',
             fontsize=15, fontweight='bold', y=0.995)
 plt.tight_layout()
-plt.savefig('../data/per_mouse_trajectories.png', dpi=300, bbox_inches='tight')
-print("Saved: ../data/per_mouse_trajectories.png")
+plt.savefig(out_dir / 'per_mouse_trajectories.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {out_dir / 'per_mouse_trajectories.png'}")
 plt.show()
 
 # Plot 2: Coefficient of Variation across mice
@@ -211,8 +214,8 @@ for idx, cond in enumerate(conditions):
 plt.suptitle('Inter-Mouse Variability: Lower CV = More consistent across mice',
             fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('../data/inter_mouse_variability.png', dpi=300, bbox_inches='tight')
-print("Saved: ../data/inter_mouse_variability.png")
+plt.savefig(out_dir / 'inter_mouse_variability.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {out_dir / 'inter_mouse_variability.png'}")
 plt.show()
 
 # Statistical test: Is temporal effect significant after accounting for mouse variability?

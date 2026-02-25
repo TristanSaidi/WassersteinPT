@@ -11,6 +11,9 @@ from pathlib import Path
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
+out_dir = Path('../outputs/GSE103334')
+out_dir.mkdir(parents=True, exist_ok=True)
+
 # Load data
 print("Loading data...")
 data_file = Path("../data/GSE103334/GSE103334_FPKM_CKP25_TOPHAT.txt.gz")
@@ -265,8 +268,8 @@ ax.legend(fontsize=10)
 ax.grid(True, alpha=0.3, axis='y')
 
 plt.tight_layout()
-plt.savefig('../data/dam_signature_analysis.png', dpi=300, bbox_inches='tight')
-print("Saved: ../data/dam_signature_analysis.png")
+plt.savefig(out_dir / 'dam_signature_analysis.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {out_dir / 'dam_signature_analysis.png'}")
 plt.show()
 
 # Summary statistics

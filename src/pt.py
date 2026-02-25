@@ -331,7 +331,7 @@ class W2EuclideanTangent(Tangent):
             raise ValueError("Tangent must be given by either (vels, locs_src) or (coupling, locs_src, locs_dst).")
 
 
-    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1, project=False):
+    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1, project=False, tol=1e-8):
         if self.coupling is not None:
             print("Warning: coupling is being converted to velocity mode via barycentric projection for parallel transport.")
             tangent = barycentric_projection_tangent(self)
@@ -349,6 +349,7 @@ class W2EuclideanTangent(Tangent):
             tangent = parallel_transport_incremental(
                 tangent=tangent,
                 incremental_tangent=incremental_tangent,
+                tol=tol,
             )
             if project:
                 tangent = project_tan(tangent) # project back onto gradient fields

@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
+out_dir = Path('../outputs/GSE103334')
+out_dir.mkdir(parents=True, exist_ok=True)
+
 # Load data (assumes you've already run the main notebook cells)
 print("Loading data...")
 data_file = Path("../data/GSE103334/GSE103334_FPKM_CKP25_TOPHAT.txt.gz")
@@ -137,8 +140,8 @@ for idx, condition in enumerate(conditions):
 plt.suptitle('Temporal Evolution: Homeostatic vs DAM Markers by Condition',
             fontsize=17, fontweight='bold', y=1.02)
 plt.tight_layout()
-plt.savefig('../data/temporal_by_condition.png', dpi=300, bbox_inches='tight')
-print("Saved: ../data/temporal_by_condition.png")
+plt.savefig(out_dir / 'temporal_by_condition.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {out_dir / 'temporal_by_condition.png'}")
 plt.show()
 
 # Plot 2: Overlay comparison
@@ -190,8 +193,8 @@ for idx, (title, gene) in enumerate(representative_genes.items()):
 plt.suptitle('Direct Comparison: CK vs CKp25 for Key Markers',
             fontsize=16, fontweight='bold', y=1.00)
 plt.tight_layout()
-plt.savefig('../data/condition_overlay_comparison.png', dpi=300, bbox_inches='tight')
-print("Saved: ../data/condition_overlay_comparison.png")
+plt.savefig(out_dir / 'condition_overlay_comparison.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {out_dir / 'condition_overlay_comparison.png'}")
 plt.show()
 
 print("\n✓ Analysis complete!")
