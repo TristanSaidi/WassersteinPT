@@ -88,7 +88,7 @@ class EmpiricalMeasure:
             Weights of the empirical measure.
         """
         self.locs = locs
-        self.weights = weights
+        self.weights = weights / weights.sum()
 
 
 def interp_tan(tangent, t_0, t_1):
@@ -135,34 +135,46 @@ def interp_tan_coupling(tangent, t_0, t_1, eps=0.0):
     assert tangent.src_measure.locs is not None and tangent.locs_dst is not None
     assert 0.0 <= t_0 <= 1.0 and 0.0 <= t_1 <= 1.0
 
-    P = np.asarray(tangent.coupling)
+    P = tangent.coupling  # may be sparse or dense
     X = np.asarray(tangent.src_measure.locs)
     Y = np.asarray(tangent.locs_dst)
 
-    if P.ndim != 2:
-        raise ValueError(f"coupling must be 2D, got {P.shape}")
     n, m = P.shape
     if X.shape[0] != n:
         raise ValueError(f"locs_src has {X.shape[0]} points but coupling has {n} rows")
     if Y.shape[0] != m:
         raise ValueError(f"locs_dst has {Y.shape[0]} points but coupling has {m} cols")
 
-    # Support of the original coupling
-    if eps > 0:
-        ii, jj = np.nonzero(P > eps)
+    # Extract nonzero entries — works for both sparse and dense
+    if sp.issparse(P):
+        P_coo = P.tocoo()
+        if eps > 0:
+            mask = P_coo.data > eps
+            ii = P_coo.row[mask].astype(int)
+            jj = P_coo.col[mask].astype(int)
+            masses = P_coo.data[mask]
+        else:
+            ii = P_coo.row.astype(int)
+            jj = P_coo.col.astype(int)
+            masses = P_coo.data.copy()
     else:
-        ii, jj = np.nonzero(P)
+        P = np.asarray(P)
+        if eps > 0:
+            ii, jj = np.nonzero(P > eps)
+        else:
+            ii, jj = np.nonzero(P)
+        masses = P[ii, jj]
 
     if ii.size == 0:
         # no mass - return empty
         d = X.shape[1]
         return W2EuclideanTangent(
-            locs_src=np.zeros((0, d)),
+            src_measure=EmpiricalMeasure(np.zeros((0, d)), np.zeros(0)),
             locs_dst=np.zeros((0, d)),
-            coupling=np.zeros((0, 0)),
+            coupling=sp.csr_matrix((0, 0)),
         )
 
-    masses = P[ii, jj]                          # (K,)
+    masses = np.asarray(masses, dtype=float)    # (K,)
     Xi = X[ii]                                  # (K,d)
     Yj = Y[jj]                                  # (K,d)
 
@@ -178,38 +190,52 @@ def interp_tan_coupling(tangent, t_0, t_1, eps=0.0):
     N0 = uniq0.shape[0]
     N1 = uniq1.shape[0]
 
-    # Build the compressed coupling: sum masses for identical (inv0, inv1) pairs
-    coup01 = np.zeros((N0, N1), dtype=masses.dtype)
-    np.add.at(coup01, (inv0, inv1), masses)
+    # Build the compressed coupling as sparse COO then CSR
+    coup01 = sp.coo_matrix((masses, (inv0, inv1)), shape=(N0, N1)).tocsr()
 
-    new_weights_0 = coup01.sum(axis=1)  # (N0,)
+    new_weights_0 = np.asarray(coup01.sum(axis=1)).ravel()  # (N0,)
     new_src_measure = EmpiricalMeasure(locs=uniq0, weights=new_weights_0)
 
     return W2EuclideanTangent(src_measure=new_src_measure, locs_dst=uniq1, coupling=coup01)
 
 def cost_euclidean(src, dst):
     # compute the cost matrix between src and dst in the Euclidean space
-    return np.linalg.norm(src[:, None, :] - dst[None, :, :], axis=-1)
+    # ot.dist uses BLAS and avoids materialising the (n, m, d) broadcast tensor
+    return ot.dist(src, dst, metric='euclidean')
 
 # general case
 def quadratic_coupling(src, dst, cost):
     # compute the optimal transport map from src to dst with cost function cost
     cost_sq = cost ** 2
-    gamma = ot.emd(src, dst, M=cost_sq)
-    return gamma
+    gamma = ot.emd(src, dst, M=cost_sq, numItermax=int(1e10))
+    # Convert to sparse immediately to avoid holding the full (n x m) dense
+    # matrix downstream — the OT plan is typically supported on a map so
+    # the sparse representation is O(n) rather than O(n*m).
+    gamma_sparse = sp.csr_matrix(gamma)
+    del gamma
+    return gamma_sparse
 
 def coupling_to_tan(coupling, src: EmpiricalMeasure, locs_dst):
     # if coupling supported on a map, return vector field. Otherwise, return coupling
     locs_src = src.locs
     # A coupling is supported on a map if each source location sends mass to at most one target
-    row_nnz = np.count_nonzero(coupling, axis=1)
-    if np.all(row_nnz <= 1):
-        # build velocities for each source location
-        dst_idx = np.argmax(coupling, axis=1)
-        vels = locs_dst[dst_idx] - locs_src
-        return W2EuclideanTangent(src_measure=src, vels=vels)
-    tangent = W2EuclideanTangent(src_measure=src, locs_dst=locs_dst, coupling=coupling)
-    return tangent
+    if sp.issparse(coupling):
+        cx = coupling.tocsr()
+        row_nnz = np.diff(cx.indptr)
+        if np.all(row_nnz <= 1):
+            # For rows with no mass (row_nnz == 0), cx.indices won't have an entry;
+            # find destination index per row safely via argmax on each row.
+            dst_idx = np.array(cx.argmax(axis=1)).ravel()
+            vels = locs_dst[dst_idx] - locs_src
+            return W2EuclideanTangent(src_measure=src, vels=vels)
+        return W2EuclideanTangent(src_measure=src, locs_dst=locs_dst, coupling=cx)
+    else:
+        row_nnz = np.count_nonzero(coupling, axis=1)
+        if np.all(row_nnz <= 1):
+            dst_idx = np.argmax(coupling, axis=1)
+            vels = locs_dst[dst_idx] - locs_src
+            return W2EuclideanTangent(src_measure=src, vels=vels)
+        return W2EuclideanTangent(src_measure=src, locs_dst=locs_dst, coupling=coupling)
 
 def wasserstein_logmap(src: EmpiricalMeasure, dst: EmpiricalMeasure):
     # compute the logarithmic map of dst at src in the Wasserstein space (for empirical measures)
@@ -237,7 +263,7 @@ def wasserstein_expmap_coupling(base: EmpiricalMeasure, tangent: Tangent = None)
     # compute the exponential map of tangent at src in the Wasserstein space (for empirical measures)
     locs_dst = tangent.locs_dst
     coupling = tangent.coupling
-    dst_weights = coupling.sum(axis=0)
+    dst_weights = np.asarray(coupling.sum(axis=0)).ravel()
     assert dst_weights.shape[0] == locs_dst.shape[0], "The number of destination locations must match the number of columns in the coupling matrix."
     return EmpiricalMeasure(locs_dst, dst_weights)
 
@@ -261,28 +287,34 @@ def align_by_nearest(X_from, X_to, tol=1e-8):
 def transport_field_under_coupling(vels_src, coupling):
     """
     vels_src : (n_src, d)
-    coupling : (n_src, n_dst) with nonnegative entries
+    coupling : (n_src, n_dst) with nonnegative entries — dense or sparse
 
     Returns
     -------
     vels_dst : (n_dst, d), where vels_dst[j] = sum_i coupling[i,j] vels_src[i] / sum_i coupling[i,j]
     dst_weights : (n_dst,), column sums of coupling
     """
-    Gamma = np.asarray(coupling)
     V = np.asarray(vels_src)
-
-    if Gamma.ndim != 2:
-        raise ValueError("coupling must be 2D")
     if V.ndim != 2:
         raise ValueError("vels_src must be 2D (n_src, d)")
-    if Gamma.shape[0] != V.shape[0]:
-        raise ValueError("coupling rows must match vels_src length")
 
-    dst_weights = Gamma.sum(axis=0)  # (n_dst,)
-    # Numerator: (n_dst, d) = (n_dst, n_src) @ (n_src, d)
-    num = Gamma.T @ V
+    if sp.issparse(coupling):
+        Gamma = coupling.tocsr()
+        if Gamma.shape[0] != V.shape[0]:
+            raise ValueError("coupling rows must match vels_src length")
+        dst_weights = np.asarray(Gamma.sum(axis=0)).ravel()  # (n_dst,)
+        # sparse matmul: (n_dst, n_src) @ (n_src, d) — only touches nonzeros
+        num = np.asarray(Gamma.T @ V)
+    else:
+        Gamma = np.asarray(coupling)
+        if Gamma.ndim != 2:
+            raise ValueError("coupling must be 2D")
+        if Gamma.shape[0] != V.shape[0]:
+            raise ValueError("coupling rows must match vels_src length")
+        dst_weights = Gamma.sum(axis=0)
+        num = Gamma.T @ V
 
-    vels_dst = np.zeros((Gamma.shape[1], V.shape[1]), dtype=V.dtype)
+    vels_dst = np.zeros((coupling.shape[1], V.shape[1]), dtype=V.dtype)
     mask = dst_weights > 0
     vels_dst[mask] = num[mask] / dst_weights[mask, None]
     return vels_dst, dst_weights
@@ -610,7 +642,7 @@ def deterministic_step_to_coupling(current: EmpiricalMeasure, incremental_tangen
     -------
     locs_src : (n_src,d)  (should equal current.locs)
     locs_dst : (n_dst,d)  unique destination locations
-    Gamma    : (n_src,n_dst) deterministic coupling with row sums = current.weights
+    Gamma    : sparse (n_src,n_dst) deterministic coupling with row sums = current.weights
     next_measure : EmpiricalMeasure(locs_dst, dst_weights)
     """
     X = np.asarray(incremental_tangent.src_measure.locs)
@@ -631,10 +663,10 @@ def deterministic_step_to_coupling(current: EmpiricalMeasure, incremental_tangen
     n_src = X.shape[0]
     n_dst = uniqY.shape[0]
 
-    Gamma = np.zeros((n_src, n_dst), dtype=w.dtype)
-    Gamma[np.arange(n_src), inv] = w
+    # Build as sparse COO — deterministic map so exactly one nonzero per row
+    Gamma = sp.csr_matrix((w, (np.arange(n_src), inv)), shape=(n_src, n_dst))
 
-    dst_w = Gamma.sum(axis=0)
+    dst_w = np.bincount(inv, weights=w, minlength=n_dst)
     next_measure = EmpiricalMeasure(uniqY, dst_w)
     return X, uniqY, Gamma, next_measure
 
@@ -650,7 +682,7 @@ def parallel_transport_incremental(tangent: W2EuclideanTangent,
     current = tangent.src_measure
     # Case A: incremental step given as a coupling
     if incremental_tangent.coupling is not None:
-        Gamma = np.asarray(incremental_tangent.coupling)
+        Gamma = incremental_tangent.coupling  # may be sparse — transport_field_under_coupling handles both
         X_step = np.asarray(incremental_tangent.src_measure.locs)
         Y_step = np.asarray(incremental_tangent.locs_dst)
 
@@ -708,11 +740,14 @@ def barycentric_projection_tangent(tan: W2EuclideanTangent, eps=1e-15):
     if tan.coupling is None or tan.src_measure.locs is None or tan.locs_dst is None:
         raise ValueError("Input must be coupling-mode: need (coupling, locs_src, locs_dst).")
 
-    Gamma = np.asarray(tan.coupling)        # (n,m)
+    if sp.issparse(tan.coupling):
+        Gamma = tan.coupling.tocsr()
+    else:
+        Gamma = np.asarray(tan.coupling)        # (n,m)
     X = np.asarray(tan.src_measure.locs)            # (n,d)
     Y = np.asarray(tan.locs_dst)            # (m,d)
 
-    if Gamma.ndim != 2:
+    if not sp.issparse(Gamma) and Gamma.ndim != 2:
         raise ValueError("coupling must be 2D")
     n, m = Gamma.shape
     if X.shape[0] != n:
@@ -724,10 +759,10 @@ def barycentric_projection_tangent(tan: W2EuclideanTangent, eps=1e-15):
     if X.shape[1] != Y.shape[1]:
         raise ValueError("locs_src and locs_dst must have the same ambient dimension.")
 
-    row_mass = Gamma.sum(axis=1)            # (n,)
+    row_mass = np.asarray(Gamma.sum(axis=1)).ravel()   # (n,)
 
     # Compute barycenters: (n,d) = (n,m) @ (m,d) / row_mass
-    bary = Gamma @ Y                        # (n,d)
+    bary = np.asarray(Gamma @ Y)            # (n,d)
     vels = np.zeros_like(X, dtype=bary.dtype)
 
     mask = row_mass > eps

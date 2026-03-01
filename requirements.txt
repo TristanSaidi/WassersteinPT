@@ -9,3 +9,4 @@ statsmodels==0.14.6
 pot==0.9.6.post1
 umap-learn==0.5.11
 GEOparse==2.0.4
+gdown>=5.2.0
