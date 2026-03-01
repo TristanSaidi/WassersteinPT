@@ -22,7 +22,7 @@ def reconstruct_cf(control: list, cf_0: np.ndarray, n: int = 10, project: bool =
     control_measures = [EmpiricalMeasure(c, weights=np.ones(len(c)) / len(c)) for c in control]
     cf_curve = [copy.copy(cf_cur)]
 
-    for i in range(n):
+    for i in range(len(control) - 1):
         # obtain current tangent vector field from control_i to control_{i+1}
         tangent_nu_i_nu_i_plus_1 = wasserstein_logmap(control_measures[i], control_measures[i+1])
         # Compute the PT update based on the control samples and the current CF
