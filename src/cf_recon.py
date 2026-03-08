@@ -2,7 +2,7 @@ import numpy as np
 from src.pt import *
 import copy
 
-def reconstruct_cf(control: list, cf_0: np.ndarray, n: int = 10, project: bool = False, tol: float = 1e-8):
+def reconstruct_cf(control: list, cf_0: np.ndarray, n: int = 10, project: bool = False, project_args: dict = {}, tol: float = 1e-8):
     """
     Reconstructs the counterfactual (CF) from the control and the initial CF (cf_0).
 
@@ -26,7 +26,7 @@ def reconstruct_cf(control: list, cf_0: np.ndarray, n: int = 10, project: bool =
         # obtain current tangent vector field from control_i to control_{i+1}
         tangent_nu_i_nu_i_plus_1 = wasserstein_logmap(control_measures[i], control_measures[i+1])
         # Compute the PT update based on the control samples and the current CF
-        cf_tan = tangent_nu_i_nu_i_plus_1.parallel_transport(control_measures[i], cf_cur, n=n, project=project, tol=tol)
+        cf_tan = tangent_nu_i_nu_i_plus_1.parallel_transport(control_measures[i], cf_cur, n=n, project=project, project_args = project_args, tol=tol)
         # Update the reconstructed CF
         cf_next = cf_tan.wasserstein_expmap()
         cf_curve.append(copy.copy(cf_next))

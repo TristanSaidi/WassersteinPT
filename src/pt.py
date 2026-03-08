@@ -12,6 +12,26 @@ from scipy.sparse.csgraph import connected_components
 import warnings
 # change to latex font
 
+def _default_compact_kernel(t):
+    """
+    Compactly supported kernel on R_+ with support [0,1].
+    Input: t = ||x_i-x_j||^2 / h^2.
+    """
+    t = np.asarray(t, dtype=float)
+    out = 1.0 - t
+    out[out < 0.0] = 0.0
+    return out
+
+
+PROJECT_ARGS_DEFAULTS = dict(
+    h=None,
+    h_r=None,
+    kernel=_default_compact_kernel,
+    alpha_reg=0.0,
+    min_neighbors=15,
+    k_bandwidth=25,
+    mixing_param=1.0,
+)
 
 def step_gauss_pt(A_t, a_t, B, M_t, sigma_0, stepsize):
     """Advance one Euler step of Gaussian parallel transport for Brenier maps.
@@ -207,7 +227,7 @@ def cost_euclidean(src, dst):
 def quadratic_coupling(src, dst, cost):
     # compute the optimal transport map from src to dst with cost function cost
     cost_sq = cost ** 2
-    gamma = ot.emd(src, dst, M=cost_sq, numItermax=int(1e10))
+    gamma = ot.emd(src, dst, M=cost_sq)
     # Convert to sparse immediately to avoid holding the full (n x m) dense
     # matrix downstream — the OT plan is typically supported on a map so
     # the sparse representation is O(n) rather than O(n*m).
@@ -267,7 +287,7 @@ def wasserstein_expmap_coupling(base: EmpiricalMeasure, tangent: Tangent = None)
     assert dst_weights.shape[0] == locs_dst.shape[0], "The number of destination locations must match the number of columns in the coupling matrix."
     return EmpiricalMeasure(locs_dst, dst_weights)
 
-def align_by_nearest(X_from, X_to, tol=1e-8):
+def align_by_nearest(X_from, X_to, tol=1e-7):
     """
     For each row in X_to, find nearest row in X_from.
     Returns indices into X_from. Raises if max dist > tol.
@@ -363,7 +383,9 @@ class W2EuclideanTangent(Tangent):
             raise ValueError("Tangent must be given by either (vels, locs_src) or (coupling, locs_src, locs_dst).")
 
 
-    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1, project=False, tol=1e-8):
+
+
+    def parallel_transport(self, src: EmpiricalMeasure, dst: EmpiricalMeasure, n=1, project=False, tol=1e-8, project_args=PROJECT_ARGS_DEFAULTS):
         if self.coupling is not None:
             print("Warning: coupling is being converted to velocity mode via barycentric projection for parallel transport.")
             tangent = barycentric_projection_tangent(self)
@@ -371,6 +393,14 @@ class W2EuclideanTangent(Tangent):
             tangent = self
         stepsize = 1.0 / n
         geodesic_tangent = wasserstein_logmap(src, dst)
+
+        # parse project_args with defaults
+        h = project_args.get('h', PROJECT_ARGS_DEFAULTS['h'])
+        h_r = project_args.get('h_r', PROJECT_ARGS_DEFAULTS['h_r'])
+        kernel = project_args.get('kernel', PROJECT_ARGS_DEFAULTS['kernel'])
+        alpha_reg = project_args.get('alpha_reg', PROJECT_ARGS_DEFAULTS['alpha_reg'])
+        min_neighbors = project_args.get('min_neighbors', PROJECT_ARGS_DEFAULTS['min_neighbors'])
+        k_bandwidth = project_args.get('k_bandwidth', PROJECT_ARGS_DEFAULTS['k_bandwidth'])
 
         for iter in range(n):
             t_0 = iter * stepsize
@@ -384,20 +414,19 @@ class W2EuclideanTangent(Tangent):
                 tol=tol,
             )
             if project:
-                tangent = project_tan(tangent) # project back onto gradient fields
+                tangent = project_tan(
+                    tangent=tangent,
+                    h=h,
+                    h_r=h_r,
+                    kernel=kernel,
+                    alpha_reg=alpha_reg,
+                    min_neighbors=min_neighbors,
+                    k_bandwidth=k_bandwidth,    
+                ) # project back onto gradient fields
 
         return tangent
 
 
-def _default_compact_kernel(t):
-    """
-    Compactly supported kernel on R_+ with support [0,1].
-    Input: t = ||x_i-x_j||^2 / h^2.
-    """
-    t = np.asarray(t, dtype=float)
-    out = 1.0 - t
-    out[out < 0.0] = 0.0
-    return out
 
 def _solve_potential_with_gauge(L, g, ridge=0.0):
     """
@@ -449,187 +478,441 @@ def _solve_potential_with_gauge(L, g, ridge=0.0):
     U -= U.mean()
 
     return U
-
-
 def project_tan(
-    tangent: "W2EuclideanTangent",
-    
-    h: float = None,
-    h_r: float = None,
+    tangent,
+    h=None,
+    h_r=None,
     kernel=_default_compact_kernel,
-    alpha_reg: float = 0.0,
-    min_neighbors: int = 15,     # <---- new
-    k_bandwidth: int = 25,      # <---- used when h/h_r are None
-    mixing_param: float = 1.0, # how much to mix the original tangent vs the projected tangent (dim * 0.5 means average, dim * 1.0 means full projection
+    alpha_reg=0.0,
+    min_neighbors=15,
+    k_bandwidth=25,
+    debug=False,
+    debug_cond_samples=True,
+    d_large_threshold=12,
+    max_mean_degree=None,
 ):
     """
-    Weighted Helmholtz-Hodge projection aligned with the manuscript, with the
-    extra guarantee that each node has at least `min_neighbors` neighbors.
+    Weighted Helmholtz-Hodge projection with optional debugging.
 
-    Graph weights: w_ij = (1/h^d) K(||xi-xj||^2 / h^2)
-    Regression weights: K(||xi-x||^2 / h_r^2) (no 1/h_r^d needed; cancels)
+    Parameters
+    ----------
+    tangent : W2EuclideanTangent
+        Input tangent field. If tangent.coupling is present, barycentric projection
+        is applied first.
+
+    h, h_r : float or None
+        Graph and regression bandwidths. If None, chosen from the mean distance to
+        the k_bandwidth-th nearest neighbor.
+
+    kernel : callable
+        Compactly supported kernel on R_+.
+
+    alpha_reg : float
+        Ridge regularization added to each local linear regression system.
+        Required to be > 0 when d >= d_large_threshold.
+
+    min_neighbors : int
+        Minimum number of neighbors enforced through kNN fallback.
+
+    k_bandwidth : int
+        Used both for automatic bandwidth selection and for kNN fallback.
+
+    debug : bool
+        If True, emit diagnostic print statements.
+
+    debug_cond_samples : bool
+        If True and debug=True, print condition numbers of a few local systems.
+
+    d_large_threshold : int
+        If ambient dimension d >= d_large_threshold, require alpha_reg > 0.
+
+    max_mean_degree : float or None
+        If not None, raise an error when the radius graph mean degree exceeds this.
+        Useful for catching near-complete graphs before memory blows up.
     """
 
-    # coupling -> velocity if needed
+    def dprint(*args, **kwargs):
+        if debug:
+            print(*args, **kwargs)
+
     if getattr(tangent, "coupling", None) is not None:
         tangent = barycentric_projection_tangent(tangent)
 
-    X = np.asarray(tangent.src_measure.locs, float)
-    V = np.asarray(tangent.vels, float)
+    X = np.asarray(tangent.src_measure.locs, dtype=float)
+    V = np.asarray(tangent.vels, dtype=float)
     N, d = X.shape
 
+    if d >= d_large_threshold and alpha_reg <= 0:
+        raise ValueError(
+            f"project_tan requires alpha_reg > 0 when d >= {d_large_threshold}. "
+            f"Got d={d}, alpha_reg={alpha_reg}."
+        )
+
+    dprint("=" * 80)
+    dprint("[project_tan] start")
+    dprint(f"[project_tan] N={N}, d={d}")
+    dprint(
+        f"[project_tan] requested h={h}, h_r={h_r}, alpha_reg={alpha_reg}, "
+        f"min_neighbors={min_neighbors}, k_bandwidth={k_bandwidth}"
+    )
+
+    # ---------------------------------------------------------
+    # Basic diagnostics on X and V
+    # ---------------------------------------------------------
+    dprint(f"[project_tan] X finite? {np.isfinite(X).all()}")
+    dprint(f"[project_tan] V finite? {np.isfinite(V).all()}")
+
+    if np.isfinite(X).any():
+        dprint(f"[project_tan] X min/max = {np.nanmin(X):.6g}, {np.nanmax(X):.6g}")
+    else:
+        dprint("[project_tan] X has no finite entries")
+
+    if np.isfinite(V).any():
+        dprint(f"[project_tan] V min/max = {np.nanmin(V):.6g}, {np.nanmax(V):.6g}")
+    else:
+        dprint("[project_tan] V has no finite entries")
+
+    bad_X_rows = (~np.isfinite(X).all(axis=1)).sum()
+    bad_V_rows = (~np.isfinite(V).all(axis=1)).sum()
+    dprint(f"[project_tan] bad X rows = {bad_X_rows}")
+    dprint(f"[project_tan] bad V rows = {bad_V_rows}")
+
+    if debug:
+        try:
+            n_unique = np.unique(X, axis=0).shape[0]
+            dprint(f"[project_tan] duplicate X rows = {N - n_unique}")
+        except Exception as e:
+            dprint(f"[project_tan] could not compute duplicate row count: {e}")
+
     if N <= min_neighbors:
-        # not enough points to guarantee min_neighbors; return as-is
+        dprint("[project_tan] N <= min_neighbors, returning tangent unchanged")
+        dprint("=" * 80)
         return tangent
+
+    if not np.isfinite(X).all():
+        raise ValueError("X contains non-finite entries before building cKDTree.")
+    if not np.isfinite(V).all():
+        raise ValueError("V contains non-finite entries before projection.")
 
     tree = cKDTree(X)
 
     # ---------------------------------------------------------
-    # Choose bandwidths via kNN if not provided
+    # Precompute kNN once
     # ---------------------------------------------------------
-    if h is None or h_r is None:
-        k0 = min(k_bandwidth, N - 1)
-        dists, _ = tree.query(X, k=k0 + 1)  # includes self at column 0
-        h_knn = float(np.mean(dists[:, k0]))
-        if h is None:
-            h = h_knn
-        if h_r is None:
-            h_r = h_knn
+    kq = min(max(k_bandwidth, min_neighbors) + 1, N)
+    dprint(f"[project_tan] querying kNN with k={kq}")
+    knn_dists, knn_idx = tree.query(X, k=kq)
 
-    if h <= 0 or h_r <= 0:
-        raise ValueError("h and h_r must be positive.")
+    dprint(f"[project_tan] knn_dists finite? {np.isfinite(knn_dists).all()}")
+    if np.isfinite(knn_dists).any():
+        dprint(
+            f"[project_tan] knn_dists min/max = "
+            f"{np.nanmin(knn_dists):.6g}, {np.nanmax(knn_dists):.6g}"
+        )
 
     # ---------------------------------------------------------
-    # Step 1: Build graph edges, ensuring >= min_neighbors per node
+    # Bandwidth selection
     # ---------------------------------------------------------
-    # Start with radius neighbors (manuscript-style)
+    k0 = min(k_bandwidth, N - 1)
+    kdist = knn_dists[:, k0]
+    finite_kdist = kdist[np.isfinite(kdist)]
+
+    dprint(f"[project_tan] k0={k0}")
+    dprint(f"[project_tan] finite k0-dist count = {finite_kdist.size} / {len(kdist)}")
+    if finite_kdist.size > 0:
+        dprint(
+            f"[project_tan] k0-dist min/median/max = "
+            f"{np.min(finite_kdist):.6g}, {np.median(finite_kdist):.6g}, {np.max(finite_kdist):.6g}"
+        )
+
+    if h is None:
+        if finite_kdist.size == 0:
+            raise ValueError("Cannot choose h: no finite kNN distances.")
+        h = float(np.mean(finite_kdist))
+
+    if h_r is None:
+        if finite_kdist.size == 0:
+            raise ValueError("Cannot choose h_r: no finite kNN distances.")
+        h_r = float(np.mean(finite_kdist))
+
+    dprint(f"[project_tan] chosen h   = {h}")
+    dprint(f"[project_tan] chosen h_r = {h_r}")
+
+    if not np.isfinite(h) or h <= 0:
+        raise ValueError(f"Invalid bandwidth h={h}")
+    if not np.isfinite(h_r) or h_r <= 0:
+        raise ValueError(f"Invalid bandwidth h_r={h_r}")
+
+    # ---------------------------------------------------------
+    # Neighborhood diagnostics AFTER valid h, h_r are known
+    # ---------------------------------------------------------
+    dprint("[project_tan] querying radius neighborhoods")
     neigh = tree.query_ball_point(X, r=h)
+    lens_raw = np.array([len(js) for js in neigh], dtype=int)
+    lens = np.array([max(len(js) - 1, 0) for js in neigh], dtype=int)
 
-    # Track neighbor sets (undirected)
-    nbrs = [set(int(j) for j in neigh[i] if j != i) for i in range(N)]
+    mean_deg = float(lens.mean())
+    dprint(
+        f"[project_tan] graph raw neighbor counts:"
+        f" min={lens_raw.min()}, mean={lens_raw.mean():.3f}, median={np.median(lens_raw):.3f}, max={lens_raw.max()}"
+    )
+    dprint(
+        f"[project_tan] graph excl-self neighbor counts:"
+        f" min={lens.min()}, mean={mean_deg:.3f}, median={np.median(lens):.3f}, max={lens.max()}"
+    )
+    dprint(f"[project_tan] total graph neighbor refs (excl self) = {lens.sum()}")
 
-    # Augment with kNN edges where needed
-    k_need = min_neighbors
+    if max_mean_degree is not None and mean_deg > max_mean_degree:
+        raise RuntimeError(
+            f"Radius graph too dense: mean degree = {mean_deg:.3f}, "
+            f"threshold = {max_mean_degree}, h = {h}."
+        )
+
+    neigh_r = tree.query_ball_point(X, r=h_r)
+    lens_r_raw = np.array([len(js) for js in neigh_r], dtype=int)
+    lens_r = np.array([max(len(js) - 1, 0) for js in neigh_r], dtype=int)
+
+    mean_deg_r = float(lens_r.mean())
+    dprint(
+        f"[project_tan] reg raw neighbor counts:"
+        f" min={lens_r_raw.min()}, mean={lens_r_raw.mean():.3f}, median={np.median(lens_r_raw):.3f}, max={lens_r_raw.max()}"
+    )
+    dprint(
+        f"[project_tan] reg excl-self neighbor counts:"
+        f" min={lens_r.min()}, mean={mean_deg_r:.3f}, median={np.median(lens_r):.3f}, max={lens_r.max()}"
+    )
+    dprint(f"[project_tan] total reg neighbor refs (excl self) = {lens_r.sum()}")
+
+    if max_mean_degree is not None and mean_deg_r > max_mean_degree:
+        raise RuntimeError(
+            f"Regression radius graph too dense: mean degree = {mean_deg_r:.3f}, "
+            f"threshold = {max_mean_degree}, h_r = {h_r}."
+        )
+
+    # ---------------------------------------------------------
+    # Step 1: Build edge list exactly
+    # ---------------------------------------------------------
+    dprint("[project_tan] building edge list")
+    edge_i = []
+    edge_j = []
+
+    for i, js in enumerate(neigh):
+        for j in js:
+            if j != i:
+                a, b = (i, j) if i < j else (j, i)
+                edge_i.append(a)
+                edge_j.append(b)
+
+    dprint(f"[project_tan] candidate radius edges (with duplicates) = {len(edge_i)}")
+
+    # ensure >= min_neighbors via kNN fallback
+    kneed = min(min_neighbors + 1, N)
+    fallback_nodes = 0
+    fallback_edges_added = 0
+
     for i in range(N):
-        if len(nbrs[i]) >= k_need:
-            continue
-        # query k_need nearest (plus self) and add them
-        dists_i, idx_i = tree.query(X[i], k=min(k_need + 1, N))
-        idx_i = [int(j) for j in np.atleast_1d(idx_i) if int(j) != i]
-        for j in idx_i:
-            nbrs[i].add(j)
-            nbrs[j].add(i)
+        js = [int(j) for j in np.atleast_1d(knn_idx[i, :kneed]) if int(j) != i]
+        if max(len(neigh[i]) - 1, 0) < min_neighbors:
+            fallback_nodes += 1
+            for j in js:
+                a, b = (i, j) if i < j else (j, i)
+                edge_i.append(a)
+                edge_j.append(b)
+                fallback_edges_added += 1
 
-    # Build unique undirected edges i<j from nbrs
-    src, dst, weights = [], [], []
-    for i in range(N):
-        for j in nbrs[i]:
-            if j <= i:
-                continue
-            dx = X[j] - X[i]
-            t = float(np.dot(dx, dx)) / (h * h)
-            kij = float(kernel(np.array([t]))[0])
-            if kij > 0.0:
-                src.append(i)
-                dst.append(j)
-                weights.append(kij / (h ** d))
-            else:
-                # If the kernel is compact and t>1, weight is 0.
-                # But we *still* want the connectivity guarantee; in that case,
-                # add a tiny weight so the edge exists numerically.
-                # This preserves the "at least 5 neighbors" requirement.
-                # (If you prefer: increase h instead of adding tiny weight.)
-                src.append(i)
-                dst.append(j)
-                weights.append(1e-12 / (h ** d))
+    dprint(f"[project_tan] fallback nodes = {fallback_nodes}")
+    dprint(f"[project_tan] fallback edges added (pre-dedup) = {fallback_edges_added}")
 
-    src = np.asarray(src, dtype=int)
-    dst = np.asarray(dst, dtype=int)
-    weights = np.asarray(weights, dtype=float)
+    if len(edge_i) == 0:
+        dprint("[project_tan] no edges found, returning tangent unchanged")
+        dprint("=" * 80)
+        return tangent
+
+    dprint("[project_tan] deduplicating edges")
+    edges = np.unique(np.column_stack([edge_i, edge_j]), axis=0)
+    src = edges[:, 0]
+    dst = edges[:, 1]
     M = len(src)
 
+    dprint(f"[project_tan] unique undirected edges M = {M}")
+
     if M == 0:
+        dprint("[project_tan] no unique edges after dedup, returning tangent unchanged")
+        dprint("=" * 80)
         return tangent
 
     # ---------------------------------------------------------
-    # Step 2: Edge actions
+    # Step 2: Edge weights and actions
     # ---------------------------------------------------------
+    dprint("[project_tan] computing edge geometry")
     DX = X[dst] - X[src]
+    dprint(f"[project_tan] DX shape = {DX.shape}, DX finite? {np.isfinite(DX).all()}")
+
+    t_edge = np.einsum("ij,ij->i", DX, DX) / (h * h)
+    dprint(f"[project_tan] t_edge finite? {np.isfinite(t_edge).all()}")
+    if np.isfinite(t_edge).any():
+        dprint(f"[project_tan] t_edge min/max = {np.nanmin(t_edge):.6g}, {np.nanmax(t_edge):.6g}")
+
+    K_edge = kernel(t_edge)
+    dprint(f"[project_tan] K_edge finite? {np.isfinite(K_edge).all()}")
+    if np.isfinite(K_edge).any():
+        dprint(f"[project_tan] K_edge min/max = {np.nanmin(K_edge):.6g}, {np.nanmax(K_edge):.6g}")
+
+    weights = K_edge / (h ** d)
+    weights[weights <= 0.0] = 1e-12 / (h ** d)
+
+    dprint(f"[project_tan] weights finite? {np.isfinite(weights).all()}")
+    if np.isfinite(weights).any():
+        dprint(f"[project_tan] weights min/max = {np.nanmin(weights):.6g}, {np.nanmax(weights):.6g}")
+
     a_edge = 0.5 * np.einsum("ij,ij->i", V[src] + V[dst], DX)
+    dprint(f"[project_tan] a_edge finite? {np.isfinite(a_edge).all()}")
+    if np.isfinite(a_edge).any():
+        dprint(f"[project_tan] a_edge min/max = {np.nanmin(a_edge):.6g}, {np.nanmax(a_edge):.6g}")
+
+    wa = weights * a_edge
+    dprint(f"[project_tan] wa finite? {np.isfinite(wa).all()}")
 
     # ---------------------------------------------------------
-    # Step 3: Potential fit via weighted Laplacian
+    # Step 3: Direct Laplacian assembly
     # ---------------------------------------------------------
-    rows = np.arange(M)
-    data = np.concatenate([-np.ones(M), np.ones(M)])
-    cols = np.concatenate([src, dst])
-    rows2 = np.concatenate([rows, rows])
+    dprint("[project_tan] assembling Laplacian")
+    diag = np.zeros(N, dtype=float)
+    np.add.at(diag, src, weights)
+    np.add.at(diag, dst, weights)
 
-    delta = sp.coo_matrix((data, (rows2, cols)), shape=(M, N)).tocsr()
-    Wedge = sp.diags(weights, format="csr")
+    g = np.zeros(N, dtype=float)
+    np.add.at(g, src, -wa)
+    np.add.at(g, dst, +wa)
 
-    L = (delta.T @ Wedge @ delta).tocsr()
-    g = (delta.T @ (weights * a_edge))
-    g = np.asarray(g, dtype=float).reshape(-1)
+    dprint(f"[project_tan] diag finite? {np.isfinite(diag).all()}")
+    dprint(f"[project_tan] g finite? {np.isfinite(g).all()}")
 
-    try:
-        U = _solve_potential_with_gauge(L, g, ridge=0.0)
-    except Exception:
-        U = _solve_potential_with_gauge(L, g, ridge=1e-10)
+    row = np.concatenate([src, dst, np.arange(N)])
+    col = np.concatenate([dst, src, np.arange(N)])
+    data = np.concatenate([-weights, -weights, diag])
+
+    L = sp.coo_matrix((data, (row, col)), shape=(N, N)).tocsr()
+    dprint(f"[project_tan] L shape = {L.shape}, nnz = {L.nnz}")
+    dprint(f"[project_tan] L.data MB   = {L.data.nbytes / 1024**2:.3f}")
+    dprint(f"[project_tan] L.indices MB= {L.indices.nbytes / 1024**2:.3f}")
+    dprint(f"[project_tan] L.indptr MB = {L.indptr.nbytes / 1024**2:.3f}")
+
+    dprint("[project_tan] solving potential")
+    U = _solve_potential_with_gauge(L, g, ridge=0.0)
+    dprint(f"[project_tan] U finite? {np.isfinite(U).all()}")
+    if np.isfinite(U).any():
+        dprint(f"[project_tan] U min/max = {np.nanmin(U):.6g}, {np.nanmax(U):.6g}")
 
     # ---------------------------------------------------------
-    # Step 4: Local linear gradient extraction with >= min_neighbors
+    # Step 4: Local linear gradient extraction
     # ---------------------------------------------------------
+    dprint("[project_tan] local linear gradient extraction")
     G = np.zeros((N, d), dtype=float)
 
-    # Start with radius regression neighbors
-    neigh_r = tree.query_ball_point(X, r=h_r)
+    n_empty = 0
+    n_fallback = 0
+    n_lstsq = 0
+    max_local_n = 0
+
+    cond_sample_idx = set()
+    if debug and debug_cond_samples and N > 0:
+        cond_sample_idx.update(range(min(5, N)))
+        cond_sample_idx.update({N // 4, N // 2, (3 * N) // 4, N - 1})
 
     for i in range(N):
-        js = [int(j) for j in neigh_r[i] if int(j) != i]
+        js = [int(j) for j in neigh_r[i] if j != i]
 
-        # Ensure at least min_neighbors by kNN fallback
         if len(js) < min_neighbors:
-            d_i, idx_i = tree.query(X[i], k=min(min_neighbors + 1, N))
-            idx_i = [int(j) for j in np.atleast_1d(idx_i) if int(j) != i]
-            js = list(set(js).union(idx_i))
+            extra = [
+                int(j) for j in np.atleast_1d(knn_idx[i, :min(min_neighbors + 1, N)])
+                if int(j) != i
+            ]
+            js = list(set(js).union(extra))
+            n_fallback += 1
 
-        js = np.asarray(js, dtype=int)
-        if js.size == 0:
+        if not js:
+            n_empty += 1
             continue
 
-        DX_loc = X[js] - X[i]
-        t = np.sum(DX_loc * DX_loc, axis=1) / (h_r * h_r)
-        K_loc = kernel(t)
+        js = np.asarray(js, dtype=int)
+        max_local_n = max(max_local_n, len(js))
 
-        # Keep positives; if too few survive, fall back to kNN weights without truncation
-        mask = K_loc > 0
-        if np.sum(mask) < min_neighbors:
-            # Use all js but with a soft weight floor for numerical stability
-            K_loc = np.maximum(K_loc, 1e-12)
-        else:
+        dx = X[js] - X[i]
+        t = np.einsum("ij,ij->i", dx, dx) / (h_r * h_r)
+        w = kernel(t).astype(float)
+
+        mask = w > 0
+        if np.sum(mask) >= min_neighbors:
             js = js[mask]
-            DX_loc = DX_loc[mask]
-            K_loc = K_loc[mask]
+            dx = dx[mask]
+            w = w[mask]
+        else:
+            w = np.maximum(w, 1e-12)
 
         y = U[js]
 
-        B = np.column_stack([np.ones(len(js)), DX_loc])  # (m, 1+d)
-        w = K_loc.astype(float)
-        # Build BtWB without forming dense diag:
-        BtWB = B.T @ (B * w[:, None])
-        BtWy = B.T @ (w * y)
+        if debug:
+            if not np.isfinite(dx).all():
+                dprint(f"[project_tan] WARNING: non-finite dx at i={i}")
+            if not np.isfinite(w).all():
+                dprint(f"[project_tan] WARNING: non-finite w at i={i}")
+            if not np.isfinite(y).all():
+                dprint(f"[project_tan] WARNING: non-finite y at i={i}")
 
-        A = BtWB + alpha_reg * np.eye(d + 1)
+        s0 = np.sum(w)
+        s1 = dx.T @ w
+        S2 = dx.T @ (dx * w[:, None])
+
+        t0 = np.dot(w, y)
+        t1 = dx.T @ (w * y)
+
+        Amat = np.empty((d + 1, d + 1), dtype=float)
+        Amat[0, 0] = s0
+        Amat[0, 1:] = s1
+        Amat[1:, 0] = s1
+        Amat[1:, 1:] = S2
+        Amat += alpha_reg * np.eye(d + 1)
+
+        rhs = np.empty(d + 1, dtype=float)
+        rhs[0] = t0
+        rhs[1:] = t1
+
+        if debug and debug_cond_samples and i in cond_sample_idx:
+            try:
+                condA = np.linalg.cond(Amat)
+                dprint(
+                    f"[project_tan] i={i}, local_n={len(js)}, "
+                    f"cond(Amat)={condA:.3e}, s0={s0:.3e}"
+                )
+            except Exception as e:
+                dprint(f"[project_tan] i={i}, cond failed: {e}")
+
         try:
-            beta = np.linalg.solve(A, BtWy)
+            beta = np.linalg.solve(Amat, rhs)
         except np.linalg.LinAlgError:
-            beta = np.linalg.lstsq(A, BtWy, rcond=None)[0]
+            beta = np.linalg.lstsq(Amat, rhs, rcond=None)[0]
+            n_lstsq += 1
+
+        if debug and not np.isfinite(beta).all():
+            dprint(f"[project_tan] WARNING: non-finite beta at i={i}")
 
         G[i] = beta[1:]
-    dim = G.shape[1]
-    # G = mixing_param/dim * G + (1 - mixing_param/dim) * V # scale mixing by 1/d due to curse of dimensionality (empirically seems to help in high d, but you can set mixing_param=d for no scaling)
+
+    dprint("[project_tan] local regression summary:")
+    dprint(f"    empty neighborhoods = {n_empty}")
+    dprint(f"    fallback-used nodes = {n_fallback}")
+    dprint(f"    lstsq fallbacks     = {n_lstsq}")
+    dprint(f"    max local n         = {max_local_n}")
+    dprint(f"[project_tan] G finite? {np.isfinite(G).all()}")
+    if np.isfinite(G).any():
+        dprint(f"[project_tan] G min/max = {np.nanmin(G):.6g}, {np.nanmax(G):.6g}")
+
+    dprint("[project_tan] done")
+    dprint("=" * 80)
+
     return W2EuclideanTangent(src_measure=tangent.src_measure, vels=G)
+
 
 def deterministic_step_to_coupling(current: EmpiricalMeasure, incremental_tangent: W2EuclideanTangent):
     """
