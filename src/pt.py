@@ -31,6 +31,12 @@ PROJECT_ARGS_DEFAULTS = dict(
     min_neighbors=15,
     k_bandwidth=25,
     mixing_param=1.0,
+    # RKHS-specific
+    rkhs=True,
+    sigma=None,
+    lam=1e-4,
+    jitter=1e-10,
+    n_rff=1000,
 )
 
 def step_gauss_pt(A_t, a_t, B, M_t, sigma_0, stepsize):
@@ -394,13 +400,39 @@ class W2EuclideanTangent(Tangent):
         stepsize = 1.0 / n
         geodesic_tangent = wasserstein_logmap(src, dst)
 
-        # parse project_args with defaults
-        h = project_args.get('h', PROJECT_ARGS_DEFAULTS['h'])
-        h_r = project_args.get('h_r', PROJECT_ARGS_DEFAULTS['h_r'])
-        kernel = project_args.get('kernel', PROJECT_ARGS_DEFAULTS['kernel'])
-        alpha_reg = project_args.get('alpha_reg', PROJECT_ARGS_DEFAULTS['alpha_reg'])
-        min_neighbors = project_args.get('min_neighbors', PROJECT_ARGS_DEFAULTS['min_neighbors'])
-        k_bandwidth = project_args.get('k_bandwidth', PROJECT_ARGS_DEFAULTS['k_bandwidth'])
+        # parse project_args with defaults (graph-based params)
+        h            = project_args.get('h',            PROJECT_ARGS_DEFAULTS['h'])
+        h_r          = project_args.get('h_r',          PROJECT_ARGS_DEFAULTS['h_r'])
+        kernel       = project_args.get('kernel',       PROJECT_ARGS_DEFAULTS['kernel'])
+        alpha_reg    = project_args.get('alpha_reg',    PROJECT_ARGS_DEFAULTS['alpha_reg'])
+        min_neighbors= project_args.get('min_neighbors',PROJECT_ARGS_DEFAULTS['min_neighbors'])
+        k_bandwidth  = project_args.get('k_bandwidth',  PROJECT_ARGS_DEFAULTS['k_bandwidth'])
+        rkhs         = project_args.get('rkhs', False)
+
+        # parse RKHS-specific params
+        sigma    = project_args.get('sigma',    None)
+        lam      = project_args.get('lam',      1e-4)
+        jitter   = project_args.get('jitter',   1e-10)
+        n_rff    = project_args.get('n_rff',    None)
+        rff_seed = project_args.get('rff_seed', None)
+
+        # Pre-compute sigma and RFF features once before the PT loop.
+        # The source support (and thus sigma) is fixed throughout transport.
+        rff_features = None
+        if project and rkhs and n_rff is not None:
+            X_src = np.asarray(tangent.src_measure.locs, dtype=float)
+            d_src = X_src.shape[1]
+            if sigma is None:
+                min_sigma = project_args.get('min_sigma', 1e-8)
+                kq = min(max(2, k_bandwidth + 1), len(X_src))
+                knn_dists, _ = cKDTree(X_src).query(X_src, k=kq)
+                k0 = min(k_bandwidth, len(X_src) - 1)
+                kth = knn_dists[:, k0]
+                sigma = max(float(np.mean(kth[np.isfinite(kth)])), float(min_sigma))
+            rng = np.random.default_rng(rff_seed)
+            Omega_pre = rng.standard_normal((n_rff, d_src)) / float(sigma)
+            b_pre     = rng.uniform(0.0, 2.0 * np.pi, n_rff)
+            rff_features = (Omega_pre, b_pre)
 
         for iter in range(n):
             t_0 = iter * stepsize
@@ -414,15 +446,17 @@ class W2EuclideanTangent(Tangent):
                 tol=tol,
             )
             if project:
-                tangent = project_tan(
+                tangent = project_tan_helper(
+                    rkhs=rkhs,
                     tangent=tangent,
-                    h=h,
-                    h_r=h_r,
-                    kernel=kernel,
-                    alpha_reg=alpha_reg,
-                    min_neighbors=min_neighbors,
-                    k_bandwidth=k_bandwidth,    
-                ) # project back onto gradient fields
+                    # graph-based
+                    h=h, h_r=h_r, kernel=kernel,
+                    alpha_reg=alpha_reg, min_neighbors=min_neighbors,
+                    k_bandwidth=k_bandwidth,
+                    # RKHS (passed through to project_tan_rkhs)
+                    sigma=sigma, lam=lam, jitter=jitter,
+                    n_rff=n_rff, rff_features=rff_features,
+                )
 
         return tangent
 
@@ -478,6 +512,187 @@ def _solve_potential_with_gauge(L, g, ridge=0.0):
     U -= U.mean()
 
     return U
+
+import numpy as np
+import scipy.linalg as linalg
+from scipy.spatial import cKDTree
+
+def choose_sigma_knn(X, k_bandwidth=25, min_sigma=1e-8):
+    X = np.asarray(X, dtype=float)
+    n = X.shape[0]
+    if n <= 1:
+        return 1.0
+    tree = cKDTree(X)
+    kq = min(max(2, k_bandwidth + 1), n)
+    dists, _ = tree.query(X, k=kq)
+    k0 = min(k_bandwidth, n - 1)
+    kth = dists[:, k0]
+    kth = kth[np.isfinite(kth)]
+    if kth.size == 0:
+        raise ValueError("Failed to choose sigma.")
+    return max(float(np.mean(kth)), float(min_sigma))
+
+
+class GaussianGradientRFFProjector:
+    """
+    Approximate gradient-RKHS projector using random Fourier features for the
+    scalar Gaussian kernel.
+
+    f_beta(x) = beta^T phi(x),
+    grad f_beta(x) = J_phi(x)^T beta.
+    """
+
+    def __init__(self, sigma=None, n_rff=1000, k_bandwidth=25,
+                 min_sigma=1e-8, seed=None):
+        self.sigma = sigma
+        self.n_rff = int(n_rff)
+        self.k_bandwidth = k_bandwidth
+        self.min_sigma = min_sigma
+        self.seed = seed
+
+        self.Omega = None   # (D, d)
+        self.b = None       # (D,)
+        self.beta = None    # (D,)
+        self.d = None
+
+    def _fit_features(self, X):
+        X = np.asarray(X, dtype=float)
+        n, d = X.shape
+        self.d = d
+
+        sigma = self.sigma
+        if sigma is None:
+            sigma = choose_sigma_knn(
+                X, k_bandwidth=self.k_bandwidth, min_sigma=self.min_sigma
+            )
+        self.sigma = float(sigma)
+
+        rng = np.random.default_rng(self.seed)
+        self.Omega = rng.standard_normal((self.n_rff, d)) / self.sigma
+        self.b = rng.uniform(0.0, 2.0 * np.pi, size=self.n_rff)
+
+    def feature_jacobian_terms(self, X):
+        """
+        Returns S with shape (n, D), where
+            S[i,r] = sqrt(2/D) * sin(omega_r^T x_i + b_r)
+
+        Then
+            grad phi_r(x_i) = -S[i,r] * omega_r.
+        """
+        X = np.asarray(X, dtype=float)
+        Z = X @ self.Omega.T + self.b[None, :]
+        S = np.sqrt(2.0 / self.n_rff) * np.sin(Z)
+        return S
+
+    def fit(self, X, V, lam=1e-4, sample_weight=None, jitter=1e-10):
+        X = np.asarray(X, dtype=float)
+        V = np.asarray(V, dtype=float)
+        n, d = X.shape
+        if V.shape != X.shape:
+            raise ValueError("X and V must have same shape.")
+
+        self._fit_features(X)
+        D = self.n_rff
+
+        if sample_weight is None:
+            w = np.ones(n, dtype=float) / n
+        else:
+            w = np.asarray(sample_weight, dtype=float).reshape(-1)
+            if w.shape[0] != n:
+                raise ValueError("sample_weight must have length n.")
+            if np.any(w < 0) or w.sum() <= 0:
+                raise ValueError("sample_weight must be nonnegative and not all zero.")
+            w = w / w.sum()
+
+        S = self.feature_jacobian_terms(X)      # (n, D)
+        Omega = self.Omega                      # (D, d)
+
+        # G_i^T G_i contribution:
+        #   G_i beta = - sum_r beta_r S[i,r] omega_r
+        # Hence
+        #   G_i^T G_i = (Omega Omega^T) \odot (S_i S_i^T)
+        OOT = Omega @ Omega.T                   # (D, D)
+
+        M = np.zeros((D, D), dtype=float)
+        rhs = np.zeros(D, dtype=float)
+
+        for i in range(n):
+            si = S[i]                           # (D,)
+            vi = V[i]                           # (d,)
+            GiTGi = np.outer(si, si) * OOT
+            M += w[i] * GiTGi
+
+            # G_i^T v_i = - s_i \odot (Omega v_i)
+            rhs += -w[i] * si * (Omega @ vi)
+
+        M += (lam + jitter) * np.eye(D)
+
+        try:
+            self.beta = linalg.solve(M, rhs, assume_a='sym')
+        except Exception:
+            self.beta = np.linalg.lstsq(M, rhs, rcond=None)[0]
+
+        return self
+
+    def grad(self, X):
+        X = np.asarray(X, dtype=float)
+        S = self.feature_jacobian_terms(X)      # (n, D)
+        # grad f(x_i) = - (S[i] * beta)^T Omega
+        return -(S * self.beta[None, :]) @ self.Omega
+    
+def project_tan_rkhs(
+    tangent,
+    sigma=None,
+    lam=1e-4,
+    n_rff=1000,
+    sample_weight=None,
+    jitter=1e-10,
+    k_bandwidth=25,
+    min_sigma=1e-8,
+    seed=None,
+    return_projector=False,
+):
+    if tangent.coupling is not None:
+        tangent_vel = barycentric_projection_tangent(tangent)
+    else:
+        tangent_vel = tangent
+
+    X = np.asarray(tangent_vel.src_measure.locs, dtype=float)
+    V = np.asarray(tangent_vel.vels, dtype=float)
+
+    if sample_weight is None:
+        sample_weight = np.asarray(tangent_vel.src_measure.weights, dtype=float)
+
+    projector = GaussianGradientRFFProjector(
+        sigma=sigma,
+        n_rff=n_rff,
+        k_bandwidth=k_bandwidth,
+        min_sigma=min_sigma,
+        seed=seed,
+    )
+    projector.fit(X, V, lam=lam, sample_weight=sample_weight, jitter=jitter)
+    G = projector.grad(X)
+
+    projected_tangent = W2EuclideanTangent(
+        src_measure=tangent_vel.src_measure,
+        vels=G,
+    )
+
+    if return_projector:
+        return projected_tangent, projector
+    return projected_tangent
+
+_PROJECT_TAN_RKHS_KEYS = {'tangent', 'sigma', 'lam', 'sample_weight', 'jitter', 'center_potential', 'k_bandwidth', 'min_sigma', 'n_rff', 'rff_seed', 'debug'}
+_PROJECT_TAN_KEYS = {'tangent', 'h', 'h_r', 'kernel', 'alpha_reg', 'min_neighbors', 'k_bandwidth', 'debug', 'debug_cond_samples', 'd_large_threshold', 'max_mean_degree'}
+
+def project_tan_helper(**kwargs):
+    if kwargs.pop('rkhs', False):
+        filtered = {k: v for k, v in kwargs.items() if k in _PROJECT_TAN_RKHS_KEYS}
+        return project_tan_rkhs(**filtered)
+    else:
+        filtered = {k: v for k, v in kwargs.items() if k in _PROJECT_TAN_KEYS}
+        return project_tan(**filtered)
+
 def project_tan(
     tangent,
     h=None,
